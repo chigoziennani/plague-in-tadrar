@@ -1,0 +1,1337 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="true">
+  <code><![CDATA[; PLAGUE IN TADRAR v2: 1 tick = 1 day, runs for 1 year
+
+globals [
+  deaths ; how many people the plague killed
+  total-cases ; how many people ever got infected
+  start-pop ; how many villagers there were at the start
+  canal ; canal condition, 0-100
+  lowest-canal ; worst the canal got all run
+  cure ; cure bar, 0-100 (like plague inc)
+  alarm? ; has the village noticed the plague yet?
+  lethality-now ; lethality right now (goes up if it mutates)
+  helpers-today ; how many houses sent someone to khams today
+  most-hungry ; most houses out of grain at once
+  
+  ; these used to be sliders - now set by the presets or defaults in setup
+  stealth ; days infected but still working & spreading
+  sick-days ; days stuck at home sick
+  mutated-lethality ; lethality after the pathogen mutates
+  alarm-threshold ; deaths needed before the village panics
+  cure-rate ; how fast the cure bar fills
+]
+
+breed [ households household ]
+breed [ villagers villager ]
+
+households-own [
+  my-field ; the patch this family farms
+  grain ; how much food the family has stored
+  scared? ; true = won't send anyone to khams
+  land ; property owned - unequal, like real Tadrar (drives how much grain it grows)
+]
+
+villagers-own [
+  my-hh ; which household they belong to
+  worker? ; true if they go out to work
+  away? ; left for wage labor in the city (Crawford & West's migration)
+  infected? ; has the disease (hidden or sick)
+  sick? ; showing symptoms -> stays home
+  immune? ; got better & can't catch it again
+  sick-time ; days since they got infected
+]
+
+patches-own [
+  zone ; "mountain" "slope" "field" "river" "canal" "dry" or "khams"
+  shade ; little random bit so the colors aren't flat
+]
+
+to setup
+  clear-all
+  set stealth 4
+  set sick-days 7
+  set mutated-lethality 70
+  set alarm-threshold 3
+  set cure-rate 1
+  set canal 100
+  set lowest-canal 100
+  set cure 0
+  set alarm? false
+  set lethality-now lethality
+  make-valley
+  make-households
+  make-villagers
+  send-migrants
+  set start-pop count villagers with [ not away? ]
+  ask n-of initial-infected villagers with [ not away? ] [ get-infected ]
+  update-colors
+  reset-ticks
+end
+
+; draws the valley: mountains on the edges, dry slopes, fields in the middle w/ a river
+to make-valley
+  ask patches [
+    set shade random-float 2
+    ifelse pxcor < 2 + random 2 or pxcor > 61 - random 2 [ set zone "mountain" ]
+    [ ifelse pxcor < 13 + random 3 or pxcor > 50 - random 3 [ set zone "slope" ]
+      [ set zone "field" ] ]
+  ]
+  ask patches with [ abs (pxcor - (29 + pycor / 8)) < 1.5 ] [ set zone "river" ]
+  ask patches with [ zone = "field" and pycor = 37 ] [ set zone "canal" ]
+  ask patches with [ zone = "field" and pycor > 37 ] [ set zone "dry" ]
+  ask patch 40 40 [ ask patches in-radius 2.5 with [ zone = "dry" ] [ set zone "khams" ] ]
+  ask patches [
+    if zone = "mountain" [ set pcolor 31 + shade ]
+    if zone = "slope" [ set pcolor 35 + shade ]
+    if zone = "river" [ set pcolor 94 + shade / 2 ]
+    if zone = "canal" [ set pcolor 96 ]
+    if zone = "dry" [ set pcolor 37 + shade / 2 ]
+    if zone = "khams" [ set pcolor 116 ]
+  ]
+end
+
+; Crawford counted 28 households in Tadrar. each gets a field, a grain store & an unequal amount of land (most have a little, a few have a lot)
+to make-households
+  create-households num-households [
+    move-to one-of patches with [ zone = "slope" and not any? households in-radius 2 ]
+    set shape "house"
+    set color white
+    set size 1.6
+    set land 1 + min (list 6 (random-exponential 1.8))
+    set my-field one-of patches with [ zone = "field" ]
+    set grain 50
+    set scared? false
+  ]
+end
+
+; each house gets 3-9 people, about 60% of them are workers
+to make-villagers
+  ask households [
+    hatch-villagers 3 + random 7 [
+      set my-hh myself
+      set shape "person"
+      set size 0.9
+      set worker? random 100 < 60
+      set away? false
+      set infected? false
+      set sick? false
+      set immune? false
+    ]
+  ]
+end
+
+; Crawford & West: men leave for wage labor. migration % of workers go away - they don't farm, do khams, or catch the plague but their labor is gone
+to send-migrants
+  ask villagers with [ worker? ] [
+    if random 100 < migration [ set away? true hide-turtle ]
+  ]
+end
+
+; plague inc style presets for the demo
+to preset-burnout
+  setup
+  set infectivity 20
+  set lethality 80
+  set lethality-now 80
+  set stealth 3
+  set sick-days 5
+  set mutation-day 0
+end
+
+to preset-silent-spreader
+  setup
+  set infectivity 15
+  set lethality 5
+  set lethality-now 5
+  set stealth 8
+  set sick-days 7
+  set mutation-day 0
+end
+
+; the plague inc strategy: spread quietly first, then turn deadly
+to preset-plague-inc
+  setup
+  set infectivity 15
+  set lethality 5
+  set lethality-now 5
+  set stealth 8
+  set sick-days 7
+  set mutation-day 20
+  set mutated-lethality 70
+end
+
+to go
+  if ticks = 365 [ stop ]
+  if mutation-day > 0 and ticks = mutation-day [ set lethality-now mutated-lethality ]
+  go-to-work
+  spread
+  display
+  farm
+  go-home
+  spread
+  eat
+  get-sicker
+  fix-canal
+  check-alarm
+  work-on-cure
+  update-colors
+  tick
+end
+
+; workers go to their field, sick people & kids stay home. every few days each house sends 1 worker to khams (unless they're scared)
+to go-to-work
+  ask villagers with [ worker? and not sick? and not away? ] [
+    move-to [ my-field ] of my-hh
+    wiggle
+  ]
+  set helpers-today 0
+  if ticks mod khams-interval = 0 [
+    ask households with [ not scared? ] [
+      let me self
+      let helpers villagers with [ my-hh = me and worker? and not sick? and not away? ]
+      if any? helpers [
+        ask one-of helpers [ move-to one-of patches with [ zone = "khams" ] wiggle ]
+        set helpers-today helpers-today + 1
+      ]
+    ]
+  ]
+end
+
+to go-home
+  ask villagers with [ not away? ] [ move-to my-hh wiggle ]
+end
+
+to wiggle
+  rt random 360
+  fd random-float 0.5
+end
+
+; anyone infected can give it to healthy people right next to them (stops once cured)
+to spread
+  if cure < 100 [
+    ask villagers with [ infected? and not away? ] [
+      ask other villagers in-radius 1.2 with [ not infected? and not immune? and not away? ] [
+        if random 100 < infectivity [ get-infected ]
+      ]
+    ]
+  ]
+end
+
+to get-infected
+  set infected? true
+  set sick-time 0
+  set total-cases total-cases + 1
+end
+
+; hidden for "stealth" days, then sick for "sick-days", then die or get better. a hungry house is weaker, so its sick are 1.5x more likely to die
+to get-sicker
+  ask villagers with [ infected? ] [
+    set sick-time sick-time + 1
+    if sick-time > stealth [ set sick? true ]
+    if sick-time > stealth + sick-days [
+      let chance lethality-now
+      if [ grain ] of my-hh = 0 [ set chance chance * 1.5 ]
+      ifelse random 100 < chance [
+        set deaths deaths + 1
+        die
+      ] [
+        set infected? false set sick? false set immune? true
+      ]
+    ]
+  ]
+end
+
+; workers in the field bring in grain - more land means more, less if the canal is bad. 1% spoils each day so rich houses settle higher than poor ones instead of growing forever
+to farm
+  ask households [
+    let me self
+    let farmers count villagers with [ my-hh = me and not away? and patch-here = [ my-field ] of me ]
+    set grain grain + farmers * (land + 2) * 0.6 * canal / 100
+    set grain grain * 0.99
+  ]
+end
+
+; everybody home eats 1 grain a day. a house w/ 0 grain is hungry. empty houses are gone
+to eat
+  ask households [
+    let me self
+    let family count villagers with [ my-hh = me and not away? ]
+    set grain grain - family
+    if grain < 0 [ set grain 0 ]
+    if family = 0 [ die ]
+  ]
+  if hungry-houses > most-hungry [ set most-hungry hungry-houses ]
+end
+
+; the canal silts up 2/day. khams days repair it depending on who showed up
+to fix-canal
+  set canal canal - 2
+  if ticks mod khams-interval = 0 and any? households [
+    set canal canal + 2.4 * khams-interval * helpers-today / count households
+  ]
+  if canal > 100 [ set canal 100 ]
+  if canal < 0 [ set canal 0 ]
+  if canal < lowest-canal [ set lowest-canal canal ]
+end
+
+; once enough die the village panics & scared houses skip khams; they rejoin when it's over
+to check-alarm
+  if not alarm? and deaths >= alarm-threshold [
+    set alarm? true
+    ask households [ if random 100 < withdrawal [ set scared? true ] ]
+  ]
+  if alarm? and not any? villagers with [ infected? ] [
+    ask households [ set scared? false ]
+  ]
+end
+
+; the cure bar fills once the village is alarmed; at 100 everyone left is cured
+to work-on-cure
+  if alarm? and cure < 100 [
+    set cure cure + cure-rate
+    if cure >= 100 [
+      set cure 100
+      ask villagers [ set infected? false set sick? false set immune? true ]
+    ]
+  ]
+end
+
+; white healthy, red hidden, orange sick, gray immune. fields brown when the canal is bad, ouses yellow when out of grain, & sized by how much land they own (so you see inequality)
+to update-colors
+  ask villagers [
+    ifelse sick? [ set color orange ]
+    [ ifelse infected? [ set color red ]
+      [ ifelse immune? [ set color gray ] [ set color white ] ] ]
+  ]
+  ask patches with [ zone = "field" ] [
+    ifelse canal < 50 [ set pcolor 36 + shade ] [ set pcolor 54 + shade ]
+  ]
+  ask households [
+    ifelse grain = 0 [ set color yellow ] [ set color white ]
+    set size 1.1 + land / 5
+  ]
+end
+
+to-report percent-infected
+  report 100 * total-cases / start-pop
+end
+
+to-report hungry-houses
+  report count households with [ grain = 0 ]
+end
+
+; how spread out grain is across the houses (bigger = more unequal). watching it over the year is a simple read on Crawford's "temporal" inequality
+to-report grain-gap
+  if not any? households [ report 0 ]
+  report standard-deviation [ grain ] of households
+end
+
+; the grain gap divided by the average - a scale-free read on inequality (the coefficient of variation). the plague shrinks the raw gap only by shrinking everyone's grain,
+; so this relative measure is the honest one: it does NOT fall when the plague hits, which is why the raw gap alone is misleading
+to-report grain-cv
+  if not any? households [ report 0 ]
+  if mean [ grain ] of households = 0 [ report 0 ]
+  report (standard-deviation [ grain ] of households) / (mean [ grain ] of households)
+end
+
+to-report migrants-away
+  report count villagers with [ away? ]
+end]]></code>
+  <widgets>
+    <view x="380" wrappingAllowedX="false" y="145" frameRate="30.0" minPycor="0" height="405" showTickCounter="true" patchSize="9.0" fontSize="10" wrappingAllowedY="false" width="585" tickCounterLabel="day" maxPycor="44" updateMode="1" maxPxcor="64" minPxcor="0"></view>
+    <plot x="1010" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="people" y="10" xMin="0.0" height="290" legend="true" xMax="50.0" yMin="0.0" width="420" xAxis="day" display="epidemic">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="healthy" color="-10899396" legend="true">
+        <setup></setup>
+        <update>plot count villagers with [ not infected? and not immune? ]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="hidden" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot count villagers with [ infected? and not sick? ]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="sick" color="-956141" legend="true">
+        <setup></setup>
+        <update>plot count villagers with [ sick? ]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="immune" color="-7500403" legend="true">
+        <setup></setup>
+        <update>plot count villagers with [ immune? ]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="dead (total)" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot deaths</update>
+      </pen>
+    </plot>
+    <monitor x="705" precision="0" y="580" height="60" fontSize="11" width="100" display="canal %">canal</monitor>
+    <monitor x="535" precision="1" y="580" height="60" fontSize="11" width="120" display="% ever infected">percent-infected</monitor>
+    <monitor x="840" precision="0" y="580" height="60" fontSize="11" width="120" display="hungry houses">hungry-houses</monitor>
+    <monitor x="380" precision="0" y="585" height="60" fontSize="11" width="100" display="deaths">deaths</monitor>
+    <slider x="15" step="1" y="135" max="50" width="180" display="infectivity" height="50" min="0" direction="Horizontal" default="20.0" variable="infectivity" units="%"></slider>
+    <slider x="20" step="1" y="195" max="100" width="170" display="lethality" height="50" min="0" direction="Horizontal" default="80.0" variable="lethality" units="%"></slider>
+    <slider x="20" step="1" y="255" max="200" width="165" display="mutation-day" height="50" min="0" direction="Horizontal" default="0.0" variable="mutation-day" units="day"></slider>
+    <slider x="15" step="1" y="315" max="40" width="185" display="num-households" height="50" min="10" direction="Horizontal" default="28.0" variable="num-households"></slider>
+    <slider x="15" step="1" y="370" max="7" width="160" display="khams-interval" height="50" min="1" direction="Horizontal" default="3.0" variable="khams-interval" units="days"></slider>
+    <slider x="15" step="1" y="430" max="100" width="175" display="withdrawal" height="50" min="0" direction="Horizontal" default="50.0" variable="withdrawal" units="%"></slider>
+    <slider x="15" step="1" y="490" max="5" width="160" display="initial-infected" height="50" min="0" direction="Horizontal" default="1.0" variable="initial-infected"></slider>
+    <slider x="15" step="1" y="545" max="60" width="175" display="migration" height="50" min="0" direction="Horizontal" default="15.0" variable="migration" units="%"></slider>
+    <button x="10" y="10" height="35" disableUntilTicks="false" forever="false" kind="Observer" width="160" display="preset: burnout plague">preset-burnout</button>
+    <button x="362" y="11" height="35" disableUntilTicks="false" forever="false" kind="Observer" width="184" display="preset: Plague Inc strategy">preset-plague-inc</button>
+    <button x="182" y="11" height="35" disableUntilTicks="false" forever="false" kind="Observer" width="160" display="preset: silent spreader">preset-silent-spreader</button>
+    <button x="170" y="65" height="38" disableUntilTicks="true" forever="true" kind="Observer" width="58" display="go">go</button>
+    <button x="280" y="65" height="38" disableUntilTicks="true" forever="false" kind="Observer" width="62" display="go once">go</button>
+    <plot x="1000" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="%" y="315" xMin="0.0" height="200" legend="true" xMax="50.0" yMin="0.0" width="420" xAxis="day" display="canal &amp; cure">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="canal" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plot canal</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="cure" color="-8630108" legend="true">
+        <setup></setup>
+        <update>plot cure</update>
+      </pen>
+    </plot>
+    <plot x="1005" autoPlotX="true" yMax="15.0" autoPlotY="true" yAxis="spread of grain" y="525" xMin="0.0" height="165" legend="true" xMax="50.0" yMin="0.0" width="415" xAxis="day" display="grain inequality over time">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="grain gap" color="-1527238" legend="true">
+        <setup></setup>
+        <update>plot grain-gap</update>
+      </pen>
+    </plot>
+  </widgets>
+  <info><![CDATA[<font color="#D73229" size="8"><b>Plague in Tadrar (v2)</b></font>
+
+*A Plague Inc-style epidemic set in a real Berber village, grounded in Crawford (2008). One tick = one day; a run lasts a year.*
+
+## What it is
+
+How do a disease’s traits - how catchy, how deadly, how sneaky - mix with Tadrar’s communal labor (**khams**) to shape an epidemic, & what the shock does to households?
+
+**Plague Inc** (a game, Ndemic Creations 2012): you design a disease. Its lesson is a trade-off - kill too fast & you get noticed & burn out; stay quiet & you spread everywhere. Epidemiologists call this the virulence-transmission trade-off (Anderson & May 1982, first fit to myxomatosis).
+
+**Tadrar**: a Berber village in Morocco’s High Atlas that David Crawford (2008) studied; he counted **28 households**. Families farm their own unequal fields but all owe labor to **khams** - communal work, above all cleaning the irrigation canal. Khams is a shared-resource (commons) problem, like the Balinese water temples Lansing & Kremer (1993) modeled: it only works if enough households turn out. It is also where different households mix, so it’s how disease jumps between them. (The real khams is a five-part division of the village that owes a fifth of the labor while owning less; I fold it into “every house owes a worker,” & leave out the 9-10 day water turns.)
+
+## The valley
+
+Mountains on the edges, houses on the dry slopes, green fields along the river, the canal (light blue) across the top, & the khams site (purple) by the canal.
+
+**Households** (houses) have one field each, a grain store, & an unequal amount of **land** - most hold a little, a few hold a lot - so you can see Crawford’s inequality at a glance (houses are sized by their land). **Villagers** belong to a house; about 60% are workers, & a share **migrate** for wage labor in the city - Crawford’s theme, & Prof. West’s own Sahel research (West 2009).
+
+## How a day works
+
+**1. Work.** Workers (those not away for wage labor) head to their field; every few days each house sends one to khams. Sick people stay home.
+**2. Spread.** Anyone infected can infect people right next to them - at work, & again at home.
+**3. Live or die.** Farmers bring in grain (more land means more, less if the canal is poor), everyone eats one, & the disease runs hidden → sick → immune or dead. A hungry house is weaker, so its sick are 1.5× likelier to die.
+
+Underneath it all: the **canal** decays & khams repairs it; deaths past a threshold set off an **alarm** so scared houses skip khams; a **cure** bar fills; & the disease can **mutate** to deadly on a set day.
+
+**Colors:** white healthy, red hidden, orange sick, gray immune. Houses are sized by land, turn yellow when out of grain, & fields brown when the canal fails.
+
+## How to run it
+
+**Pick a preset, then press `go`.** (The village sliders - num-households, khams-interval, withdrawal, migration, & initial-infected - you can set first; the disease dials are set by the presets.)
+
+* **Burnout plague** - deadly & obvious; spreads through a few houses, then burns out.
+* **Silent spreader** - mild & sneaky; infects most of the valley, kills few.
+* **Plague Inc strategy** - silent, then mutates to deadly on day 20.
+
+## Experiments to try
+
+Each changes one thing & watches what happens - & each hits one part of my question (how a disease’s traits mix with khams to shape the epidemic, & what the shock does to households).
+
+**Compare the three presets.** Run burnout, silent spreader, & Plague Inc. Burnout kills hard but reaches few (~22% infected); the silent strain spreads everywhere (~62%); Plague Inc does both & kills the most (~66 deaths). The virulence-transmission trade-off, straight out of the model.
+
+**Sweep the khams-interval slider.** This is the heart of my question - *is the communal labor that keeps the canal alive also spreading the sickness?* Hold the silent strain fixed & change only how often the village does khams. The answer is a clean, steady climb: khams every 7 days infects ~18% of the valley, every 3 days ~71%, every day ~94%. The more the village gathers, the more the disease jumps between households. Khams is the main route the disease travels - a no-khams control (on my list below) would pin it down for sure.
+
+**Sweep the lethality slider.** There is a **threshold**, not a smooth slope. At low lethality the strain reaches ~42% of the valley; once it is deadly enough to kill about 3 people it trips the **alarm**, & past that point the size drops to a noisy ~15-30% & stops climbing. It is not host burnout (the infectious period is fixed here) - the cap comes from the village’s own khams-withdrawal kicking in sooner against a deadlier strain (the cure bar fills far too slowly to matter here). No single rule sets the cap; it falls out of the alarm & withdrawal interacting.
+
+**Withdrawal 0 vs 100.** Run Plague Inc with withdrawal low, then high. Watch the **canal**: pulling households out of khams barely changes the death toll, but the canal slips (about 85 down to 57) & every harvest suffers - a commons breaking down.
+
+**Migration 0 vs 50.** More men away means less labor, but also fewer people exposed - so the epidemic spreads less.
+
+**Run the same preset a few times.** It’s random: some outbreaks fizzle in the first house, others take the valley.
+
+## What I did (my extension)
+
+I started from the class **Spread of Disease** & **Flocking** models & took them further:
+
+* made the disease play like **Plague Inc** - stealth, lethality, a cure bar, mutation, & presets
+* set it in Crawford’s **Tadrar** - 28 households on unequal land, fields, a canal, & khams labor
+* added **grain, migration, & a hunger feedback**, so I can track inequality (the grain spread) over the year, the way West & Crawford study household livelihoods
+
+**The surprise:** I expected the epidemic to *widen* inequality (Crawford calls Tadrar’s inequality “temporal”). The honest answer is subtler, & it only shows up if you measure inequality the right way. The raw grain gap does end *lower* with the plague (~285 vs ~403 in a normal year) - but that is only because the plague shrinks the whole harvest (average grain falls from ~293 to ~199). Measured relative to the average - the scale-free **coefficient of variation** (gap ÷ average), which is how inequality is actually defined - the plague does *not* equalize the village; CV holds about flat, if anything edging up (~1.37 to ~1.43). So the plague doesn’t level Tadrar, it just makes everyone poorer. Inequality here is set by unequal **land**, not by the plague.
+
+## Limits & what I’d do next
+
+Things I simplified & what I’d add if I had more time:
+
+* **Khams is stripped down.** The real khams is a five-part division that owes a fifth of the labor; I fold it into “every house sends a worker,” & I leave out the 9-10 day water turns.
+* **One village, fixed land.** Land never changes hands & there’s no household life-cycle, so I can’t really show Crawford’s *temporal* inequality - the way a household rises & falls over a generation.
+* **Migration is one-shot.** People leave once at setup & never send money home or return; West’s households move back & forth.
+* **What I’d add next:** a real Gini measure, error bars on the sweeps, & a no-khams control to pin down exactly how much of the spread is the communal labor.
+
+## The NetLogo I used
+
+The model is mine, but not the language. Where each non-obvious command came from:
+
+* **my turtle-grass lab** - `ask`, `if`/`ifelse`, `hatch`, `die`, `random`, `create-<breed>`
+* **my Game of Life lab** - `patches-own`, `count ... with [...]`, nested `ifelse`
+* **class Spread of Disease model** - `one-of`, `n-of`, `any?`, `with`, `myself`, `self`
+* **class Flocking model** - `in-radius`, `to-report`
+* **NetLogo Programming Guide / Dictionary** - `breed`, `mod`, `standard-deviation`, `random-exponential`
+
+Anything I was unsure of I checked in BIND (bind.netlogo.org) & the NetLogo docs (docs.netlogo.org/7.0.3).
+
+## Credits & References (Sources)
+
+Chigozie Nnani <a href="https:/chigoziennani.com">**(chigoziennani.com)**</a> - ANTH 404 - Fall 2026
+
+**Ideas & setting**
+
+* Crawford, D. (2008). *Moroccan Households in the World Economy: Labor and Inequality in a Berber Village.* Baton Rouge: LSU Press. *(Tadrar; 28 households; land/labor inequality; khams & the canal)*
+* Anderson, R. M., & May, R. M. (1982). Coevolution of hosts and parasites. *Parasitology, 85*(2), 411-426. *(the virulence-transmission trade-off; myxomatosis)*
+* Lansing, J. S., & Kremer, J. N. (1993). Emergent properties of Balinese water temple networks. *American Anthropologist, 95*(1), 97-114. *(irrigation as an emergent commons - the khams/canal framing)*
+* West, C. T. (2009). Domestic transitions, desiccation, agricultural intensification, and livelihood diversification among rural households on the Central Plateau, Burkina Faso. *American Anthropologist, 111*(3), 275-288. *(household livelihoods, diversification, & migration)*
+* Ndemic Creations. (2012). *Plague Inc.* [Video game]. *(the pathogen design: sliders, the cure bar, & mutation)*
+
+**Code & NetLogo**
+
+* Wilensky, U. (2008). NetLogo Spread of Disease model; (1998) Flocking; (1999) NetLogo. Center for Connected Learning, Northwestern University.
+* Wilensky, U., & Rand, W. (2015). *An Introduction to Agent-Based Modeling.* MIT Press.
+* Beginner’s Interactive NetLogo Dictionary (BIND, 2021); NetLogo Programming Guide + Dictionary v7.0.3.
+]]></info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="link" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="link direction" rotatable="true" editableColorIndex="0">
+      <line endX="30" startY="150" marked="true" color="-1920102913" endY="225" startX="150"></line>
+      <line endX="270" startY="150" marked="true" color="-1920102913" endY="225" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>preset-silent-spreader repeat 40 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="lethality-sweep" repetitions="15" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>deaths</metric>
+        <metric>percent-infected</metric>
+        <metric>lowest-canal</metric>
+        <metric>hungry-houses</metric>
+        <metric>most-hungry</metric>
+        <metric>grain-gap</metric>
+        <metric>grain-cv</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="infectivity">
+          <value value="15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="khams-interval">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="migration">
+          <value value="15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutation-day">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <steppedValueSet variable="lethality" first="0" step="10" last="100"></steppedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="withdrawal-sweep" repetitions="15" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>preset-plague-inc</setup>
+      <go>go</go>
+      <metrics>
+        <metric>deaths</metric>
+        <metric>percent-infected</metric>
+        <metric>lowest-canal</metric>
+        <metric>hungry-houses</metric>
+        <metric>most-hungry</metric>
+        <metric>grain-gap</metric>
+        <metric>grain-cv</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="khams-interval">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="migration">
+          <value value="15"></value>
+        </enumeratedValueSet>
+        <steppedValueSet variable="withdrawal" first="0" step="25" last="100"></steppedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="lethality-sweep-emergence" repetitions="10" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>deaths</metric>
+        <metric>percent-infected</metric>
+        <metric>lowest-canal</metric>
+        <metric>hungry-houses</metric>
+        <metric>most-hungry</metric>
+        <metric>grain-gap</metric>
+        <metric>grain-cv</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="infectivity">
+          <value value="15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="khams-interval">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="migration">
+          <value value="15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutation-day">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <steppedValueSet variable="lethality" first="0" step="10" last="100"></steppedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="khams-interval-sweep" repetitions="20" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>preset-silent-spreader</setup>
+      <go>go</go>
+      <metrics>
+        <metric>deaths</metric>
+        <metric>percent-infected</metric>
+        <metric>lowest-canal</metric>
+        <metric>hungry-houses</metric>
+        <metric>most-hungry</metric>
+        <metric>grain-gap</metric>
+        <metric>grain-cv</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-households">
+          <value value="28"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="withdrawal">
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="migration">
+          <value value="15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="initial-infected">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <steppedValueSet variable="khams-interval" first="1" step="1" last="7"></steppedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
